@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MSQ → VE Table Extractor</title>
+    <style>
+        body { font-family: monospace; background: #1a1a1a; color: #e0e0e0; margin: 40px; }
+        h1 { color: #ff6f00; }
+        #dropZone {
+            border: 3px dashed #ff6f00; border-radius: 10px; padding: 60px;
+            text-align: center; font-size: 22px; color: #999; margin: 30px 0;
+            cursor: pointer; transition: all 0.3s;
+        }
+        #dropZone:hover, #dropZone.dragover { border-color: #ffab00; color: #ffab00; background: #2a2a1a; }
+        #status { font-size: 16px; margin: 10px 0; }
+        button { background: #ff6f00; color: white; border: none; padding: 10px 20px; font-size: 14px; cursor: pointer; border-radius: 5px; margin: 5px; }
+        button:hover { background: #ff8f00; }
+        .btn-blue { background: #1976d2; }
+        .btn-blue:hover { background: #2196f3; }
+        .btn-green { background: #388e3c; }
+        .btn-green:hover { background: #4caf50; }
+        .btn-gray { background: #555; }
+        .btn-gray:hover { background: #777; }
+        #buttons { display: none; margin: 15px 0; }
+        #info { display: none; background: #111; padding: 15px; border-radius: 5px; margin: 15px 0; font-size: 13px; line-height: 1.6; }
+        #tableDisplay { display: none; margin: 15px 0; }
+        table.ve { border-collapse: collapse; font-size: 12px; }
+        table.ve th { background: #333; color: #ff6f00; padding: 4px 8px; border: 1px solid #444; text-align: center; min-width: 40px; }
+        table.ve td { background: #222; padding: 4px 8px; border: 1px solid #333; text-align: center; }
+        table.ve td.header { background: #333; color: #ff6f00; font-weight: bold; }
+        #output { display: none; white-space: pre; background: #111; padding: 20px; border-radius: 5px; margin: 15px 0; font-size: 13px; line-height: 1.4; overflow-x: auto; max-height: 400px; overflow-y: auto; }
+        .label { color: #999; font-size: 12px; margin-bottom: 4px; }
+        select { background: #333; color: #e0e0e0; border: 1px solid #555; padding: 6px 10px; border-radius: 4px; font-family: monospace; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <h1>MSQ → VE Table Extractor</h1>
+    <p style="color:#999;">Drop your .msq file — extracts VE table and breakpoints, flipped for the VE correction tool.</p>
+
+    <div id="dropZone" onclick="document.getElementById('fileInput').click()">
+        Drop .msq file here
+    </div>
+    <input type="file" id="fileInput" accept=".msq" style="display:none">
+
+    <div id="status"></div>
+
+    <div id="info"></div>
+
+    <div id="buttons">
+        <span class="label">VE Table: </span>
+        <select id="tableSelect" onchange="displaySelected()"></select>
+        <span style="margin-left: 20px;">
+            <button onclick="copyVETable()">Copy VE Table</button>
+            <button class="btn-blue" onclick="copyBreakpoints()">Copy Breakpoints</button>
+            <button class="btn-green" onclick="copyAll()">Copy All (Table + Breakpoints)</button>
+            <button class="btn-gray" onclick="downloadMSQInfo()">Download Summary</button>
+        </span>
+    </div>
+
+    <div id="tableDisplay"></div>
+    <div id="output"></div>
+
+    <script>
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        let parsedData = null;
+        let selectedTable = 'veTable1';
+
+        dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+        dropZone.addEventListener('drop', e => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
+        });
+        fileInput.addEventListener('change', e => { if (e.target.files.length) processFile(e.target.files[0]); });
+
+        function processFile(file) {
+            const reader = new FileReader();
+            reader.onload = e => {
+                try {
+                    parsedData = parseMSQ(e.target.result);
+                    displayResults();
+                    document.getElementById('status').textContent = '✓ MSQ parsed successfully';
+                    document.getElementById('status').style.color = '#4CAF50';
+                } catch (err) {
+                    document.getElementById('status').textContent = '✗ Error: ' + err.message;
+                    document.getElementById('status').style.color = '#ff4444';
+                    console.error(err);
+                }
+            };
+            reader.readAsText(file, 'iso-8859-1');
+        }
+
+        function parseMSQ(text) {
+            const result = {
+                meta: {},
+                tables: {},
+                breakpoints: {}
+            };
+
+            // Parse metadata
+            const authorMatch = text.match(/author="([^"]+)"/);
+            if (authorMatch) result.meta.author = authorMatch[1];
+
+            const dateMatch = text.match(/writeDate="([^"]+)"/);
+            if (dateMatch) result.meta.date = dateMatch[1];
+
+            const firmwareMatch = text.match(/firmwareInfo="([^"]+)"/);
+            if (firmwareMatch) result.meta.firmware = decodeURIComponent(firmwareMatch[1].replace(/\+/g, ' '));
+
+            // Parse algorithm
+            const algoMatch = text.match(/<constant name="algorithm">"([^"]+)"/);
+            if (algoMatch) result.meta.algorithm = algoMatch[1];
+
+            // Parse number of cylinders
+            const cylMatch = text.match(/<constant name="nCylinders">"(\d+)"/);
+            if (cylMatch) result.meta.cylinders = cylMatch[1];
+
+            // Parse VE tables (1, 2, 3)
+            for (let t = 1; t <= 3; t++) {
+                const tableName = `veTable${t}`;
+                const rpmName = `frpm_table${t}`;
+                const mapName = `fmap_table${t}`;
+
+                // Extract VE table
+                const tableRegex = new RegExp(`<constant[^>]*name="${tableName}"[^>]*rows="(\\d+)"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const tableMatch = text.match(tableRegex);
+                if (tableMatch) {
+                    const rows = parseInt(tableMatch[1]);
+                    const values = tableMatch[2].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                    const cols = values.length / rows;
+
+                    // Build 2D array
+                    const table = [];
+                    for (let r = 0; r < rows; r++) {
+                        table.push(values.slice(r * cols, (r + 1) * cols));
+                    }
+
+                    result.tables[tableName] = {
+                        data: table,
+                        rows: rows,
+                        cols: cols
+                    };
+                }
+
+                // Extract RPM breakpoints
+                const rpmRegex = new RegExp(`<constant[^>]*name="${rpmName}"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const rpmMatch = text.match(rpmRegex);
+                if (rpmMatch) {
+                    result.breakpoints[rpmName] = rpmMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                }
+
+                // Extract MAP breakpoints
+                const mapRegex = new RegExp(`<constant[^>]*name="${mapName}"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const mapMatch = text.match(mapRegex);
+                if (mapMatch) {
+                    result.breakpoints[mapName] = mapMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                }
+            }
+
+            // Also check for 12x12 tables
+            for (let t = 1; t <= 3; t++) {
+                const tableName = `veTable${t}dozen`;
+                const rpmName = `frpm_table${t}doz`;
+                const mapName = `fmap_table${t}doz`;
+
+                const tableRegex = new RegExp(`<constant[^>]*name="${tableName}"[^>]*rows="(\\d+)"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const tableMatch = text.match(tableRegex);
+                if (tableMatch) {
+                    const rows = parseInt(tableMatch[1]);
+                    const values = tableMatch[2].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                    const cols = values.length / rows;
+
+                    const table = [];
+                    for (let r = 0; r < rows; r++) {
+                        table.push(values.slice(r * cols, (r + 1) * cols));
+                    }
+
+                    result.tables[tableName] = { data: table, rows: rows, cols: cols };
+                }
+
+                const rpmRegex = new RegExp(`<constant[^>]*name="${rpmName}"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const rpmMatch = text.match(rpmRegex);
+                if (rpmMatch) {
+                    result.breakpoints[rpmName] = rpmMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                }
+
+                const mapRegex = new RegExp(`<constant[^>]*name="${mapName}"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const mapMatch = text.match(mapRegex);
+                if (mapMatch) {
+                    result.breakpoints[mapName] = mapMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                }
+            }
+
+            // EGO settings
+            const egoMatch = text.match(/<constant[^>]*name="EgoOption"[^>]*>"([^"]+)"/);
+            if (egoMatch) result.meta.egoOption = egoMatch[1];
+
+            const egoAuthMatch = text.match(/<constant[^>]*name="egoLimit"[^>]*>([\d.]+)/);
+            if (egoAuthMatch) result.meta.egoAuthority = egoAuthMatch[1] + '%';
+
+            const egoCountMatch = text.match(/<constant[^>]*name="egoCount"[^>]*>([\d.]+)/);
+            if (egoCountMatch) result.meta.egoCount = egoCountMatch[1];
+
+            const egoRPMMatch = text.match(/<constant[^>]*name="egoRPM"[^>]*>([\d.]+)/);
+            if (egoRPMMatch) result.meta.egoRPM = egoRPMMatch[1];
+
+            const egoDelayMatch = text.match(/<constant[^>]*name="ego_startdelay"[^>]*>([\d.]+)/);
+            if (egoDelayMatch) result.meta.egoStartDelay = egoDelayMatch[1] + 's';
+
+            const fcEgoDelayMatch = text.match(/<constant[^>]*name="fc_ego_delay"[^>]*>([\d.]+)/);
+            if (fcEgoDelayMatch) result.meta.fcEgoDelay = fcEgoDelayMatch[1] + 's';
+
+            // Injector settings
+            const injOpenMatch = text.match(/<constant[^>]*name="injOpen"[^>]*>([\d.]+)/);
+            if (injOpenMatch) result.meta.injOpen = parseFloat(injOpenMatch[1]);
+
+            const battFacMatch = text.match(/<constant[^>]*name="battFac"[^>]*>([\d.]+)/);
+            if (battFacMatch) result.meta.battFac = parseFloat(battFacMatch[1]);
+
+            const injOpen2Match = text.match(/<constant[^>]*name="injOpen2"[^>]*>([\d.]+)/);
+            if (injOpen2Match) result.meta.injOpen2 = parseFloat(injOpen2Match[1]);
+
+            const battFac2Match = text.match(/<constant[^>]*name="battFac2"[^>]*>([\d.]+)/);
+            if (battFac2Match) result.meta.battFac2 = parseFloat(battFac2Match[1]);
+
+            const reqFuelMatch = text.match(/<constant[^>]*name="reqFuel"[^>]*>([\d.]+)/);
+            if (reqFuelMatch) result.meta.reqFuel = reqFuelMatch[1] + 'ms';
+
+            const dividerMatch = text.match(/<constant[^>]*name="divider"[^>]*>([\d.]+)/);
+            if (dividerMatch) result.meta.divider = dividerMatch[1];
+
+            const alternateMatch = text.match(/<constant[^>]*name="alternate"[^>]*>"([^"]+)"/);
+            if (alternateMatch) result.meta.alternate = alternateMatch[1];
+
+            const nInjMatch = text.match(/<constant[^>]*name="nInjectors"[^>]*>"(\d+)"/);
+            if (nInjMatch) result.meta.nInjectors = nInjMatch[1];
+
+            const injSizeMatch = text.match(/<constant[^>]*name="staged_pri_size"[^>]*>([\d.]+)/);
+            if (injSizeMatch && parseFloat(injSizeMatch[1]) > 0) result.meta.injSize = injSizeMatch[1] + 'cc';
+
+            // DFCO settings
+            const fcRPMMatch = text.match(/<constant[^>]*name="fc_rpm"[^>]*>([\d.]+)/);
+            if (fcRPMMatch) result.meta.fcRPM = fcRPMMatch[1];
+
+            const fcDelayMatch = text.match(/<constant[^>]*name="fc_delay"[^>]*>([\d.]+)/);
+            if (fcDelayMatch) result.meta.fcDelay = fcDelayMatch[1] + 's';
+
+            const fcKpaMatch = text.match(/<constant[^>]*name="fc_kpa"[^>]*>([\d.]+)/);
+            if (fcKpaMatch) result.meta.fcKpa = fcKpaMatch[1] + ' kPa';
+
+            const fcTPSMatch = text.match(/<constant[^>]*name="fc_tps"[^>]*>([\d.]+)/);
+            if (fcTPSMatch) result.meta.fcTPS = fcTPSMatch[1] + '%';
+
+            // AFR tables
+            for (let t = 1; t <= 2; t++) {
+                const afrName = `afrTable${t}`;
+                const afrRegex = new RegExp(`<constant[^>]*name="${afrName}"[^>]*rows="(\\d+)"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const afrMatch2 = text.match(afrRegex);
+                if (afrMatch2) {
+                    const rows = parseInt(afrMatch2[1]);
+                    const values = afrMatch2[2].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                    const cols = values.length / rows;
+                    const table = [];
+                    for (let r = 0; r < rows; r++) {
+                        table.push(values.slice(r * cols, (r + 1) * cols));
+                    }
+                    result.tables[afrName] = { data: table, rows, cols };
+                }
+            }
+
+            // Warmup Enrichment curve
+            const tempTableMatch = text.match(/<constant[^>]*name="tempTable"[^>]*>([\\s\\S]*?)<\/constant>/);
+            if (tempTableMatch) {
+                result.meta.wueTempBins = tempTableMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+            }
+            const wueBinsMatch = text.match(/<constant[^>]*name="wueBins"[^>]*>([\\s\\S]*?)<\/constant>/);
+            if (wueBinsMatch) {
+                result.meta.wueBins = wueBinsMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+            }
+
+            // ASE (After Start Enrichment)
+            const aseMatch = text.match(/<constant[^>]*name="asePctTable"[^>]*>([\\s\\S]*?)<\/constant>/);
+            if (aseMatch) {
+                result.meta.aseBins = aseMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+            }
+
+            // AE (Accel Enrichment) settings
+            const taeTimeMatch = text.match(/<constant[^>]*name="taeTime"[^>]*>([\d.]+)/);
+            if (taeTimeMatch) result.meta.taeTime = taeTimeMatch[1] + 's';
+
+            const taeColdAMatch = text.match(/<constant[^>]*name="taeColdA"[^>]*>([\d.]+)/);
+            if (taeColdAMatch) result.meta.taeColdA = taeColdAMatch[1] + 'ms';
+
+            const taeColdMMatch = text.match(/<constant[^>]*name="taeColdM"[^>]*>([\d.]+)/);
+            if (taeColdMMatch) result.meta.taeColdM = taeColdMMatch[1] + '%';
+
+            const tpsThreshMatch = text.match(/<constant[^>]*name="tpsThresh"[^>]*>([\d.]+)/);
+            if (tpsThreshMatch) result.meta.tpsThresh = tpsThreshMatch[1] + ' %/s';
+
+            const mapThreshMatch = text.match(/<constant[^>]*name="mapThresh"[^>]*>([\d.]+)/);
+            if (mapThreshMatch) result.meta.mapThresh = mapThreshMatch[1] + ' kPa/s';
+
+            const aeLorpmMatch = text.match(/<constant[^>]*name="ae_lorpm"[^>]*>([\d.]+)/);
+            if (aeLorpmMatch) result.meta.aeLorpm = aeLorpmMatch[1];
+
+            const aeHirpmMatch = text.match(/<constant[^>]*name="ae_hirpm"[^>]*>([\d.]+)/);
+            if (aeHirpmMatch) result.meta.aeHirpm = aeHirpmMatch[1];
+
+            const tdePctMatch = text.match(/<constant[^>]*name="tdePct"[^>]*>([\d.]+)/);
+            if (tdePctMatch) result.meta.tdePct = tdePctMatch[1] + '%';
+
+            const taeBinsMatch = text.match(/<constant[^>]*name="taeBins"[^>]*>([\\s\\S]*?)<\/constant>/);
+            if (taeBinsMatch) {
+                result.meta.taeBins = taeBinsMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+            }
+
+            const taeRatesMatch = text.match(/<constant[^>]*name="taeRates"[^>]*>([\\s\\S]*?)<\/constant>/);
+            if (taeRatesMatch) {
+                result.meta.taeRates = taeRatesMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+            }
+
+            const eaeLagSrcMatch = text.match(/<constant[^>]*name="EAElagsource"[^>]*>"([^"]+)"/);
+            if (eaeLagSrcMatch) result.meta.eaeLagSource = eaeLagSrcMatch[1];
+
+            const eaeLagThreshMatch = text.match(/<constant[^>]*name="EAElagthresh"[^>]*>([\d.]+)/);
+            if (eaeLagThreshMatch) result.meta.eaeLagThresh = eaeLagThreshMatch[1];
+
+            const eaeLagRPMMatch = text.match(/<constant[^>]*name="EAElagRPMmax"[^>]*>([\d.]+)/);
+            if (eaeLagRPMMatch) result.meta.eaeLagRPMmax = eaeLagRPMMatch[1];
+
+            // Rev limiter
+            const revLimMatch = text.match(/<constant[^>]*name="RevLimNormal2"[^>]*>([\d.]+)/);
+            if (revLimMatch) result.meta.revLimit = revLimMatch[1] + ' RPM';
+
+            const revLimHystMatch = text.match(/<constant[^>]*name="RevLimNormal2_hyst"[^>]*>([\d.]+)/);
+            if (revLimHystMatch) result.meta.revLimHyst = revLimHystMatch[1] + ' RPM';
+
+            const revLimRetMatch = text.match(/<constant[^>]*name="RevLimOption_retard"[^>]*>"([^"]+)"/);
+            if (revLimRetMatch) result.meta.revLimRetard = revLimRetMatch[1];
+
+            const revLimFCMatch = text.match(/<constant[^>]*name="RevLimOption_fuelcut"[^>]*>"([^"]+)"/);
+            if (revLimFCMatch) result.meta.revLimFuelCut = revLimFCMatch[1];
+
+            const revLimMaxRtdMatch = text.match(/<constant[^>]*name="RevLimMaxRtd"[^>]*>([\d.]+)/);
+            if (revLimMaxRtdMatch) result.meta.revLimMaxRetard = revLimMaxRtdMatch[1] + ' deg';
+
+            // Cranking RPM
+            const crankRPMMatch = text.match(/<constant[^>]*name="crankingRPM"[^>]*>([\d.]+)/);
+            if (crankRPMMatch) result.meta.crankingRPM = crankRPMMatch[1] + ' RPM';
+
+            // CLT sensor type
+            const cltExpMatch = text.match(/name="clt_exp"[^>]*>"([^"]+)"/);
+            if (cltExpMatch) result.meta.cltSensor = cltExpMatch[1];
+
+            // Spark advance tables (12x12)
+            for (let t = 1; t <= 2; t++) {
+                const spkName = `advanceTable${t}`;
+                const spkRpmName = `srpm_table${t}`;
+                const spkMapName = `smap_table${t}`;
+
+                const spkRegex = new RegExp(`<constant[^>]*name="${spkName}"[^>]*rows="(\\d+)"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const spkMatch = text.match(spkRegex);
+                if (spkMatch) {
+                    const rows = parseInt(spkMatch[1]);
+                    const values = spkMatch[2].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                    const cols = values.length / rows;
+                    const table = [];
+                    for (let r = 0; r < rows; r++) {
+                        table.push(values.slice(r * cols, (r + 1) * cols));
+                    }
+                    result.tables[spkName] = { data: table, rows, cols, type: 'spark' };
+                }
+
+                const spkRpmRegex = new RegExp(`<constant[^>]*name="${spkRpmName}"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const spkRpmMatch = text.match(spkRpmRegex);
+                if (spkRpmMatch) {
+                    result.breakpoints[spkRpmName] = spkRpmMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                }
+
+                const spkMapRegex = new RegExp(`<constant[^>]*name="${spkMapName}"[^>]*>([\\s\\S]*?)<\\/constant>`);
+                const spkMapMatch = text.match(spkMapRegex);
+                if (spkMapMatch) {
+                    result.breakpoints[spkMapName] = spkMapMatch[1].trim().split(/\s+/).map(v => parseFloat(v)).filter(v => !isNaN(v));
+                }
+            }
+
+            return result;
+        }
+
+        function getFlippedTable(tableName) {
+            const t = parsedData.tables[tableName];
+            if (!t) return null;
+
+            // Flip rows (MSQ stores MAP ascending, tool wants MAP descending)
+            return {
+                data: [...t.data].reverse(),
+                rows: t.rows,
+                cols: t.cols
+            };
+        }
+
+        function getFlippedMapBreaks(tableName) {
+            let mapKey;
+            if (tableName.includes('dozen')) {
+                mapKey = 'fmap_table' + tableName.match(/\d/)[0] + 'doz';
+            } else if (tableName.startsWith('advance')) {
+                mapKey = 'smap_table' + tableName.match(/\d/)[0];
+            } else if (tableName.startsWith('afr')) {
+                // AFR tables use dozen breakpoints (12x12)
+                mapKey = 'fmap_table' + tableName.match(/\d/)[0] + 'doz';
+            } else {
+                mapKey = 'fmap_table' + tableName.match(/\d/)[0];
+            }
+            const breaks = parsedData.breakpoints[mapKey];
+            if (!breaks) return null;
+            return [...breaks].reverse();
+        }
+
+        function getRpmBreaks(tableName) {
+            let rpmKey;
+            if (tableName.includes('dozen')) {
+                rpmKey = 'frpm_table' + tableName.match(/\d/)[0] + 'doz';
+            } else if (tableName.startsWith('advance')) {
+                rpmKey = 'srpm_table' + tableName.match(/\d/)[0];
+            } else if (tableName.startsWith('afr')) {
+                rpmKey = 'frpm_table' + tableName.match(/\d/)[0] + 'doz';
+            } else {
+                rpmKey = 'frpm_table' + tableName.match(/\d/)[0];
+            }
+            return parsedData.breakpoints[rpmKey] || null;
+        }
+
+        function displayResults() {
+            // Info panel
+            const meta = parsedData.meta;
+            let info = '';
+            if (meta.firmware) info += `Firmware: ${meta.firmware}\n`;
+            if (meta.date) info += `Saved: ${meta.date}\n`;
+            if (meta.algorithm) info += `Algorithm: ${meta.algorithm}\n`;
+            if (meta.cylinders) info += `Cylinders: ${meta.cylinders}\n`;
+
+            info += `\n--- Injector Configuration ---\n`;
+            if (meta.injOpen !== undefined) info += `Dead Time (injOpen): ${meta.injOpen}ms\n`;
+            if (meta.battFac !== undefined) info += `Battery Correction (battFac): ${meta.battFac} ms/V\n`;
+            if (meta.injOpen !== undefined && meta.battFac !== undefined) {
+                info += `  @ 12.0V: ${(meta.injOpen + meta.battFac * 2).toFixed(3)}ms\n`;
+                info += `  @ 13.5V: ${(meta.injOpen + meta.battFac * 0.5).toFixed(3)}ms\n`;
+                info += `  @ 14.0V: ${meta.injOpen.toFixed(3)}ms (reference)\n`;
+                info += `  @ 14.5V: ${(meta.injOpen - meta.battFac * 0.5).toFixed(3)}ms\n`;
+            }
+            if (meta.injOpen2 !== undefined) info += `Dead Time Ch2 (injOpen2): ${meta.injOpen2}ms  battFac2: ${meta.battFac2} ms/V\n`;
+            if (meta.reqFuel) info += `Req Fuel: ${meta.reqFuel}\n`;
+            if (meta.divider) info += `Divider: ${meta.divider}\n`;
+            if (meta.nInjectors) info += `Injectors: ${meta.nInjectors}\n`;
+            if (meta.injSize) info += `Injector Size: ${meta.injSize}\n`;
+            if (meta.alternate) info += `Firing: ${meta.alternate}\n`;
+
+            info += `\n--- EGO / Closed Loop ---\n`;
+            if (meta.egoOption) info += `EGO Mode: ${meta.egoOption}\n`;
+            if (meta.egoAuthority) info += `EGO Authority: ±${meta.egoAuthority}\n`;
+            if (meta.egoCount) info += `EGO Steps/Cycle: ${meta.egoCount}\n`;
+            if (meta.egoRPM) info += `EGO Min RPM: ${meta.egoRPM}\n`;
+            if (meta.egoStartDelay) info += `EGO Start Delay: ${meta.egoStartDelay}\n`;
+            if (meta.fcEgoDelay) info += `EGO Delay After FC: ${meta.fcEgoDelay}\n`;
+
+            info += `\n--- DFCO (Overrun Fuel Cut) ---\n`;
+            if (meta.fcRPM) info += `FC RPM: ${meta.fcRPM}\n`;
+            if (meta.fcKpa) info += `FC MAP: ${meta.fcKpa}\n`;
+            if (meta.fcTPS) info += `FC TPS: ${meta.fcTPS}\n`;
+            if (meta.fcDelay) info += `FC Delay: ${meta.fcDelay}\n`;
+
+            info += `\n--- Warmup Enrichment (WUE) ---\n`;
+            if (meta.wueTempBins && meta.wueBins) {
+                info += `Temp (°F):  ${meta.wueTempBins.map(v => String(v).padStart(6)).join('')}\n`;
+                info += `WUE (%):    ${meta.wueBins.map(v => String(Math.round(v)).padStart(6)).join('')}\n`;
+                const wue160 = meta.wueTempBins.findIndex(t => t >= 160);
+                if (wue160 >= 0) {
+                    info += `  → WUE at ${meta.wueTempBins[wue160]}°F: ${meta.wueBins[wue160]}%`;
+                    if (meta.wueBins[wue160] > 105) info += ` ⚠️ Above 105% — tool should filter`;
+                    else info += ` ✓ At 100% — no filtering needed`;
+                    info += '\n';
+                }
+            }
+
+            if (meta.aseBins && meta.wueTempBins) {
+                info += `\n--- After Start Enrichment (ASE) ---\n`;
+                info += `ASE (%):    ${meta.aseBins.map(v => String(Math.round(v)).padStart(6)).join('')}\n`;
+            }
+
+            info += `\n--- Accel Enrichment (AE) ---\n`;
+            if (meta.taeTime) info += `AE Duration: ${meta.taeTime}\n`;
+            if (meta.taeColdA) info += `AE Cold Adder: ${meta.taeColdA}\n`;
+            if (meta.taeColdM) info += `AE Cold Multiplier: ${meta.taeColdM}\n`;
+            if (meta.tpsThresh) info += `TPS Threshold: ${meta.tpsThresh}\n`;
+            if (meta.mapThresh) info += `MAP Threshold: ${meta.mapThresh}\n`;
+            if (meta.aeLorpm && meta.aeHirpm) info += `AE RPM Range: ${meta.aeLorpm} - ${meta.aeHirpm}\n`;
+            if (meta.tdePct) info += `Decel Enleanment: ${meta.tdePct}\n`;
+            if (meta.taeBins && meta.taeRates) {
+                info += `TPS AE Curve: ${meta.taeRates.map(v => v + '%/s').join(', ')} → ${meta.taeBins.map(v => v + 'ms').join(', ')}\n`;
+            }
+            if (meta.eaeLagSource) {
+                info += `EAE Lag: ${meta.eaeLagSource} > ${meta.eaeLagThresh} (RPM < ${meta.eaeLagRPMmax})\n`;
+            }
+
+            info += `\n--- Rev Limiter ---\n`;
+            if (meta.revLimit) info += `Rev Limit: ${meta.revLimit}\n`;
+            if (meta.revLimHyst) info += `Hysteresis: ${meta.revLimHyst}\n`;
+            if (meta.revLimRetard) info += `Retard Mode: ${meta.revLimRetard}\n`;
+            if (meta.revLimFuelCut) info += `Fuel Cut: ${meta.revLimFuelCut}\n`;
+            if (meta.revLimMaxRetard) info += `Max Retard: ${meta.revLimMaxRetard}\n`;
+
+            info += `\n--- Sensors ---\n`;
+            if (meta.cltSensor) info += `CLT Sensor: ${meta.cltSensor}\n`;
+            if (meta.crankingRPM) info += `Cranking RPM: ${meta.crankingRPM}\n`;
+
+            const tableNames = Object.keys(parsedData.tables);
+            info += `\n--- Tables Found ---\n`;
+            for (const name of tableNames) {
+                const t = parsedData.tables[name];
+                info += `  ${name}: ${t.rows}x${t.cols}\n`;
+            }
+
+            document.getElementById('info').textContent = info;
+            document.getElementById('info').style.display = 'block';
+
+            // Populate table selector
+            const select = document.getElementById('tableSelect');
+            select.innerHTML = '';
+            for (const name of tableNames) {
+                const opt = document.createElement('option');
+                opt.value = name;
+                opt.textContent = `${name} (${parsedData.tables[name].rows}x${parsedData.tables[name].cols})`;
+                select.appendChild(opt);
+            }
+            selectedTable = tableNames[0];
+
+            document.getElementById('buttons').style.display = 'block';
+            displaySelected();
+        }
+
+        // Smart number display — preserve decimals when they exist
+        function fmtVE(v) {
+            if (v % 1 === 0) return String(Math.round(v));
+            return parseFloat(v.toFixed(1)).toString();
+        }
+
+        function displaySelected() {
+            selectedTable = document.getElementById('tableSelect').value;
+            const flipped = getFlippedTable(selectedTable);
+            const mapBreaks = getFlippedMapBreaks(selectedTable);
+            const rpmBreaks = getRpmBreaks(selectedTable);
+
+            if (!flipped) {
+                document.getElementById('tableDisplay').innerHTML = '<p style="color:red">Table not found</p>';
+                return;
+            }
+
+            // Build HTML table
+            let html = `<p style="color:#999; font-size:12px; margin-bottom:8px;">
+                Flipped for VE tool (Row 0 = highest MAP). 
+                RPM across top, MAP down side — matches TunerStudio layout.
+            </p>`;
+            html += '<table class="ve"><tr><th>kPa \\ RPM</th>';
+
+            if (rpmBreaks) {
+                for (const rpm of rpmBreaks) html += `<th>${Math.round(rpm)}</th>`;
+            } else {
+                for (let c = 0; c < flipped.cols; c++) html += `<th>Col ${c}</th>`;
+            }
+            html += '</tr>';
+
+            for (let r = 0; r < flipped.rows; r++) {
+                html += '<tr>';
+                if (mapBreaks) {
+                    html += `<td class="header">${mapBreaks[r]}</td>`;
+                } else {
+                    html += `<td class="header">Row ${r}</td>`;
+                }
+                for (let c = 0; c < flipped.cols; c++) {
+                    const v = flipped.data[r][c];
+                    // Color scale — adjust range for table type
+                    const tableInfo = parsedData.tables[selectedTable];
+                    const isSpark = tableInfo && tableInfo.type === 'spark';
+                    const isAFR = selectedTable.startsWith('afr');
+                    let pct;
+                    if (isSpark) {
+                        pct = Math.min(1, Math.max(0, (v - 10) / 30)); // 10-40 deg range
+                    } else if (isAFR) {
+                        pct = Math.min(1, Math.max(0, (v - 11) / 4)); // 11-15 AFR range
+                    } else {
+                        pct = Math.min(1, Math.max(0, (v - 40) / 120)); // 40-160 VE range
+                    }
+                    const r255 = Math.round(50 + pct * 150);
+                    const g255 = Math.round(80 + (1 - Math.abs(pct - 0.5) * 2) * 100);
+                    const b255 = Math.round(200 - pct * 150);
+                    html += `<td style="background:rgba(${r255},${g255},${b255},0.3)">${isAFR ? v.toFixed(1) : isSpark ? v.toFixed(1) : fmtVE(v)}</td>`;
+                }
+                html += '</tr>';
+            }
+            html += '</table>';
+
+            document.getElementById('tableDisplay').innerHTML = html;
+            document.getElementById('tableDisplay').style.display = 'block';
+
+            // Build text output
+            buildTextOutput();
+        }
+
+        function buildTextOutput() {
+            const flipped = getFlippedTable(selectedTable);
+            const mapBreaks = getFlippedMapBreaks(selectedTable);
+            const rpmBreaks = getRpmBreaks(selectedTable);
+            if (!flipped) return;
+
+            let txt = '';
+            txt += `=== ${selectedTable} (flipped for VE tool) ===\n\n`;
+
+            // Show injector and EGO info for VE tables
+            if (selectedTable.startsWith('veTable')) {
+                const m = parsedData.meta;
+                if (m.injOpen !== undefined) {
+                    txt += `--- Injector Dead Time ---\n`;
+                    txt += `Base (injOpen): ${m.injOpen}ms\n`;
+                    txt += `Battery Factor (battFac): ${m.battFac} ms/V\n`;
+                    if (m.battFac !== undefined) {
+                        txt += `  @ 12.0V: ${(m.injOpen + m.battFac * 2).toFixed(3)}ms\n`;
+                        txt += `  @ 13.5V: ${(m.injOpen + m.battFac * 0.5).toFixed(3)}ms\n`;
+                        txt += `  @ 14.0V: ${m.injOpen.toFixed(3)}ms (ref)\n`;
+                    }
+                    txt += '\n';
+                }
+                if (m.egoAuthority) {
+                    txt += `--- EGO ---\n`;
+                    txt += `Authority: ±${m.egoAuthority}\n`;
+                    if (m.egoRPM) txt += `Min RPM: ${m.egoRPM}\n`;
+                    if (m.fcEgoDelay) txt += `Post-FC EGO Delay: ${m.fcEgoDelay}\n`;
+                    txt += '\n';
+                }
+                if (m.reqFuel) txt += `Req Fuel: ${m.reqFuel} | Divider: ${m.divider} | Firing: ${m.alternate}\n`;
+                if (m.injSize) txt += `Injector Size: ${m.injSize} | Count: ${m.nInjectors}\n`;
+                txt += '\n';
+            }
+
+            if (rpmBreaks) txt += `RPM Breakpoints: ${rpmBreaks.map(v => Math.round(v)).join(', ')}\n`;
+            if (mapBreaks) txt += `MAP Breakpoints: ${mapBreaks.join(', ')}\n`;
+            txt += '\n';
+
+            txt += 'VE Table (paste into tool):\n';
+            const isSparkTable = selectedTable.startsWith('advance');
+            const isAFRTable = selectedTable.startsWith('afr');
+            if (isSparkTable) {
+                txt += 'SPARK ADVANCE TABLE (degrees):\n';
+            } else if (isAFRTable) {
+                txt += 'AFR TARGET TABLE:\n';
+            }
+            for (let r = 0; r < flipped.rows; r++) {
+                if (isAFRTable) {
+                    txt += flipped.data[r].map(v => v.toFixed(1)).join('\t') + '\n';
+                } else if (isSparkTable) {
+                    txt += flipped.data[r].map(v => v.toFixed(1)).join('\t') + '\n';
+                } else {
+                    txt += flipped.data[r].map(v => fmtVE(v)).join('\t') + '\n';
+                }
+            }
+
+            document.getElementById('output').textContent = txt;
+            document.getElementById('output').style.display = 'block';
+        }
+
+        function copyVETable() {
+            const flipped = getFlippedTable(selectedTable);
+            if (!flipped) return;
+
+            const isAFR = selectedTable.startsWith('afr');
+            const isSpark = parsedData.tables[selectedTable] && parsedData.tables[selectedTable].type === 'spark';
+            const txt = flipped.data.map(row => row.map(v => (isAFR || isSpark) ? v.toFixed(1) : fmtVE(v)).join('\t')).join('\n');
+            navigator.clipboard.writeText(txt).then(() => {
+                document.getElementById('status').textContent = '✓ Table copied (tab-delimited, ready to paste)';
+                document.getElementById('status').style.color = '#4CAF50';
+            });
+        }
+
+        function copyBreakpoints() {
+            const mapBreaks = getFlippedMapBreaks(selectedTable);
+            const rpmBreaks = getRpmBreaks(selectedTable);
+            if (!mapBreaks || !rpmBreaks) return;
+
+            const txt = `RPM: ${rpmBreaks.map(v => Math.round(v)).join(', ')}\nMAP: ${mapBreaks.join(', ')}`;
+            navigator.clipboard.writeText(txt).then(() => {
+                document.getElementById('status').textContent = '✓ Breakpoints copied';
+                document.getElementById('status').style.color = '#4CAF50';
+            });
+        }
+
+        function copyAll() {
+            const flipped = getFlippedTable(selectedTable);
+            const mapBreaks = getFlippedMapBreaks(selectedTable);
+            const rpmBreaks = getRpmBreaks(selectedTable);
+            if (!flipped) return;
+
+            const isAFR = selectedTable.startsWith('afr');
+            const isSpark = parsedData.tables[selectedTable] && parsedData.tables[selectedTable].type === 'spark';
+
+            let txt = '';
+            if (rpmBreaks) txt += `RPM: ${rpmBreaks.map(v => Math.round(v)).join(', ')}\n`;
+            if (mapBreaks) txt += `MAP: ${mapBreaks.join(', ')}\n`;
+            txt += '\n';
+            txt += flipped.data.map(row => row.map(v => (isAFR || isSpark) ? v.toFixed(1) : fmtVE(v)).join('\t')).join('\n');
+
+            navigator.clipboard.writeText(txt).then(() => {
+                document.getElementById('status').textContent = '✓ All copied (breakpoints + table)';
+                document.getElementById('status').style.color = '#4CAF50';
+            });
+        }
+
+        function downloadMSQInfo() {
+            const txt = document.getElementById('output').textContent;
+            const blob = new Blob([txt], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `MSQ_Extract_${selectedTable}_${new Date().toISOString().slice(0,10)}.txt`;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+    </script>
+</body>
+</html>
